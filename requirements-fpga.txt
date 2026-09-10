@@ -1,0 +1,6 @@
+# Lightweight CPU frontend for an independently running FPGA inference server.
+numpy==1.26.4
+pillow
+qwen-vl-utils
+torch
+transformers==4.57.0

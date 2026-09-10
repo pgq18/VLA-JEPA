@@ -124,6 +124,19 @@ VLA-JEPA supports training on both robot datasets and human video datasets. You 
 
 
 <a id="evaluation"></a>
+## FPGA inference frontend
+
+`starVLA.deployment.VLAJEPAFPGAPolicy` is the lightweight production inference
+entrypoint for the exported FPGA pipeline. It loads only the Qwen3-VL
+tokenizer/image processor, performs CPU preprocessing and Flow Matching noise
+generation, and sends protocol-v2 model inputs to the independent FPGA server.
+It never constructs the Qwen, V-JEPA, or action-head model classes. The class
+keeps the existing `predict_action(batch_images=..., instructions=..., state=...)`
+surface and returns `normalized_actions` with shape `[1,7,7]`.
+
+For a frontend-only environment, install `requirements-fpga.txt`; the main
+`requirements.txt` remains the complete training and evaluation environment.
+
 ## 📊 Evaluation
 
 Download the model checkpoints from Hugging Face: https://huggingface.co/ginwind/VLA-JEPA
