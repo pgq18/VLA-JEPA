@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+/piper_setup/
+/runs
+
+# Machine-local environments, credentials and generated artifacts.
+.venv/
+.conda/
+.env
+.env.*
+!.env.example
+/cache/
+/checkpoints/
+/models/
+/datasets/
+/logs/
+/outputs/
+/wandb/
+*.log
+*.pt
+*.pth
+*.ckpt
+*.safetensors

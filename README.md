@@ -109,7 +109,8 @@ Once the configurations are updated, you can proceed to start the training proce
 ### 3️⃣ Optional: Custom Dataset Training
 VLA-JEPA supports training on both robot datasets and human video datasets. You can run custom training by specifying robot data and/or human videos in your configuration.
 
-- **Robot Data:** We support training with datasets in the LeRobot v2.1 format. Convert your custom robot dataset to LeRobot v2.1 first.
+- **PiPER elevator data (LeRobot v3):** The native PiPER path reads `piper_elevator_lerobot_press_30hz` directly, with both cameras, absolute base-frame XYZ plus 6D rotation, and no learned gripper channel. See [PiPER training and inference](docs/piper_lerobot.md) for the dedicated environment, four-GPU trainer, validation, and checkpoint inference. This path does not require dataset conversion or `modality.json`.
+- **Other robot data:** The generic robot loader supports LeRobot v2.1. Convert custom datasets intended for that loader to LeRobot v2.1 first.
   - Define a custom robot dataset config class in [`data_config.py`](./starVLA/dataloader/gr00t_lerobot/data_config.py) (its video-key fields should match the values predefined in `modality.json`; see [`modality.json`](./examples/Droid/modality.json)), and add a mapping from `robot_type` to the config class in `ROBOT_TYPE_CONFIG_MAP`.
   - `robot_type` is specified by `DATASET_NAMED_MIXTURES` in [`mixtures.py`](./starVLA/dataloader/gr00t_lerobot/mixtures.py): the dict key corresponds to `datasets.vla_data.data_mix` in the YAML training config, and the value is a tuple of sub-datasets. Each sub-dataset tuple contains three items: subdirectory, version, and `robot_type`. The `robot_type` selects the corresponding config for state/action normalization and other field alignment.
   - Finally, update the YAML config accordingly and launch training.

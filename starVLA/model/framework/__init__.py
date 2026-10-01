@@ -30,7 +30,7 @@ if pkg_path is not None:
         for _, module_name, _ in pkgutil.iter_modules(pkg_path):
             importlib.import_module(f"{__name__}.{module_name}")
     except Exception as e:
-        logger.log(f"Warning: Failed to auto-import framework submodules: {e}")
+        logger.warning(f"Failed to auto-import optional framework submodules: {e}")
         
 def build_framework(cfg):
     """
@@ -45,7 +45,12 @@ def build_framework(cfg):
     if not hasattr(cfg.framework, "name"): 
         cfg.framework.name = cfg.framework.framework_py  # Backward compatibility for legacy config yaml
         
-    if cfg.framework.name == "QwenOFT":
+    if cfg.framework.name == "VLA_JEPA":
+        # The native PiPER environment intentionally installs only VLA-JEPA's
+        # dependencies; unrelated frameworks must not prevent this import.
+        from starVLA.model.framework.VLA_JEPA import VLA_JEPA
+        return VLA_JEPA(cfg)
+    elif cfg.framework.name == "QwenOFT":
         from starVLA.model.framework.QwenOFT import Qwenvl_OFT
         return Qwenvl_OFT(cfg)
     elif cfg.framework.name == "QwenFast":

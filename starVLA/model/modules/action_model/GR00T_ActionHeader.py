@@ -213,6 +213,19 @@ DiTConfig = {
     "DiT-L": {"input_embedding_dim": 1536, "attention_head_dim": 48, "num_attention_heads": 32},
 }
 
+
+def masked_action_mse(prediction, target, action_is_pad=None):
+    """Average over real action elements; keep an all-padding loss in the graph."""
+    error = (prediction.float() - target.float()).square()
+    if action_is_pad is None:
+        return error.mean()
+    if action_is_pad.dtype != torch.bool or action_is_pad.shape != error.shape[:2]:
+        raise ValueError("action_is_pad must be bool [batch, action_horizon]")
+    valid = ~action_is_pad.to(device=error.device)
+    denominator = (valid.sum() * error.shape[-1]).clamp_min(1)
+    return error.masked_fill(~valid.unsqueeze(-1), 0).sum() / denominator
+
+
 class FlowmatchingActionHead(nn.Module):
     def __init__(
         self,
@@ -231,6 +244,8 @@ class FlowmatchingActionHead(nn.Module):
         self.model = DiT(**diffusion_model_cfg)
         self.action_dim = config.action_dim
         self.action_horizon = config.future_action_window_size + 1
+        if config.action_horizon != self.action_horizon:
+            raise ValueError("action_horizon must equal future_action_window_size + 1")
         self.num_inference_timesteps = config.num_inference_timesteps
 
         self.state_encoder = MLP(
@@ -267,11 +282,31 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=batch)
 
 
-    def forward(self, vl_embs: torch.Tensor, actions: torch.Tensor, state: torch.Tensor = None):
+    def _encode_state(self, state, batch_size):
+        if state is None:
+            return None
+        if self.state_encoder is None:
+            raise ValueError("A state was provided but config.state_dim disables the state encoder")
+        if state.ndim == 2:
+            state = state.unsqueeze(1)
+        if (state.ndim != 3 or state.shape[0] != batch_size
+                or state.shape[-1] != self.config.state_dim):
+            raise ValueError("state must have shape [batch, state_tokens, config.state_dim]")
+        return self.state_encoder(state.to(device=self.device, dtype=self.dtype))
+
+    def forward(self, vl_embs: torch.Tensor, actions: torch.Tensor, state: torch.Tensor = None,
+                action_is_pad: torch.Tensor = None):
         """
         vl_embs: shape (B, seq_length, feature_dim)
-        actions: shape (B, future_action_window_size, D_action)
+        actions: shape (B, action_horizon, config.action_dim)
+        action_is_pad: optional bool (B, action_horizon), True excludes the row.
         """
+        if actions.ndim != 3 or actions.shape[1:] != (self.action_horizon, self.action_dim):
+            raise ValueError("actions must match configured action_horizon and action_dim")
+        if actions.shape[0] != vl_embs.shape[0]:
+            raise ValueError("Action and conditioning batch sizes differ")
+        vl_embs = vl_embs.to(dtype=self.dtype)
+        actions = actions.to(dtype=self.dtype)
         device = vl_embs.device
 
         # Embed noised action trajectory.
@@ -288,7 +323,7 @@ class FlowmatchingActionHead(nn.Module):
 
 
         # embed state
-        state_features = self.state_encoder(state) if state is not None else None
+        state_features = self._encode_state(state, vl_embs.shape[0])
 
 
         # Maybe add position embedding.
@@ -313,24 +348,27 @@ class FlowmatchingActionHead(nn.Module):
         pred_actions = pred[:, -actions.shape[1] :]
 
         # Slice out only the action portion of pred and target.
-        loss = ((pred_actions - velocity) ** 2).mean()
+        loss = masked_action_mse(pred_actions, velocity, action_is_pad)
         return loss
 
     @torch.no_grad()
     def predict_action(self, vl_embs: torch.Tensor, state: torch.Tensor = None) -> torch.Tensor:
         # Set initial actions as the sampled noise.
+        vl_embs = vl_embs.to(dtype=self.dtype)
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
         actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
+            size=(batch_size, self.action_horizon, self.action_dim),
             dtype=vl_embs.dtype,
             device=device,
         )
 
         num_steps = self.num_inference_timesteps
+        if num_steps is None or num_steps < 1:
+            raise ValueError("num_inference_timesteps must be positive")
         dt = 1.0 / num_steps
         
-        state_features = self.state_encoder(state) if state is not None else None
+        state_features = self._encode_state(state, batch_size)
 
         # Run denoising steps.
         for t in range(num_steps):

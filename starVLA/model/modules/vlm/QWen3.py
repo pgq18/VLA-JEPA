@@ -5,7 +5,7 @@
 import torch
 from typing import Optional, List
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor, AutoConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from typing import Dict, Optional, List
 from torch.nn.utils.rnn import pad_sequence
@@ -55,12 +55,23 @@ class _QWen3_VL_Interface(nn.Module):
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3-VL-4B-Instruct")
 
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_id,
-            attn_implementation="flash_attention_2",
-            dtype=torch.bfloat16,
-            device_map="cuda",
-        )
+        attention = qwenvl_config.get("attn_implementation", "flash_attention_2")
+        if qwenvl_config.get("init_from_config", False):
+            # The Piper trainer strictly loads the complete official VLA-JEPA
+            # checkpoint next, including this backbone. Avoid a duplicate 4GB
+            # base-model download solely to overwrite every parameter.
+            model = Qwen3VLForConditionalGeneration._from_config(
+                AutoConfig.from_pretrained(model_id),
+                attn_implementation=attention,
+                torch_dtype=torch.bfloat16,
+            ).to(qwenvl_config.get("device_map", "cuda"))
+        else:
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_id,
+                attn_implementation=attention,
+                dtype=torch.bfloat16,
+                device_map=qwenvl_config.get("device_map", "cuda"),
+            )
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 
@@ -80,9 +91,15 @@ class _QWen3_VL_Interface(nn.Module):
         """
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            outputs = self.model(
-                **kwargs,
-            )
+            if self.config.framework.qwenvl.get("features_only", False):
+                # VLA uses multimodal hidden states; allocating vocabulary
+                # logits and retaining every layer output serves no purpose.
+                from types import SimpleNamespace
+                kwargs.pop("output_hidden_states", None)
+                outputs = self.model.model(**kwargs, output_hidden_states=False)
+                outputs = SimpleNamespace(hidden_states=(outputs.last_hidden_state,))
+            else:
+                outputs = self.model(**kwargs)
 
         return outputs
 

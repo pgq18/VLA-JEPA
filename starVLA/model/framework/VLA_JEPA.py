@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
-from transformers import AutoVideoProcessor, AutoModel, AutoTokenizer, VJEPA2VideoProcessor
+from transformers import AutoConfig, AutoVideoProcessor, AutoModel, AutoTokenizer, VJEPA2VideoProcessor
 
 from starVLA.training.trainer_utils import initialize_overwatch
 
@@ -30,6 +30,44 @@ from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_mod
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
+
+
+def stack_padding_mask(examples, key, length, device):
+    """Optional masks are batch-wide; do not silently treat missing rows as real."""
+    present = [key in example for example in examples]
+    if not any(present):
+        return None
+    if not all(present):
+        raise ValueError(f"{key} must be present for every example or omitted for all")
+    mask = torch.as_tensor(np.stack([example[key] for example in examples]), device=device)
+    if mask.dtype != torch.bool or mask.shape != (len(examples), length):
+        raise ValueError(f"{key} must be bool [batch, {length}]")
+    return mask
+
+
+def masked_world_model_l1(prediction, target, video_is_pad=None, tubelet_size=2):
+    """Map frame padding to future tubelets and then to their spatial tokens.
+
+    The target skips encoder tubelet 0. A target tubelet is valid only if every
+    contributing frame is real, since the encoder mixes its tubelet's frames.
+    """
+    if prediction.shape != target.shape or prediction.ndim != 3:
+        raise ValueError("World-model prediction and target must share [batch, tokens, channels]")
+    error = (prediction.float() - target.float()).abs()
+    if video_is_pad is None:
+        return error.mean()
+    if (video_is_pad.dtype != torch.bool or video_is_pad.ndim != 2
+            or video_is_pad.shape[0] != error.shape[0]
+            or tubelet_size < 1 or video_is_pad.shape[1] % tubelet_size):
+        raise ValueError("video_is_pad must be bool [batch, frames] divisible by tubelet_size")
+    valid_steps = ~video_is_pad.to(error.device).reshape(error.shape[0], -1, tubelet_size).any(-1)
+    valid_steps = valid_steps[:, 1:]
+    if not valid_steps.shape[1] or error.shape[1] % valid_steps.shape[1]:
+        raise ValueError("Future tubelets do not match the world-model target tokens")
+    valid = valid_steps.repeat_interleave(error.shape[1] // valid_steps.shape[1], dim=1)
+    denominator = (valid.sum() * error.shape[-1]).clamp_min(1)
+    return error.masked_fill(~valid.unsqueeze(-1), 0).sum() / denominator
+
 
 @FRAMEWORK_REGISTRY.register("VLA_JEPA")
 class VLA_JEPA(baseframework):
@@ -78,10 +116,23 @@ class VLA_JEPA(baseframework):
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
         
-        self.vj_encoder = AutoModel.from_pretrained(self.config.framework.vj2_model.base_encoder)
+        encoder_config = self.config.framework.vj2_model
+        if encoder_config.get("init_from_config", False):
+            # The trainer must subsequently load every encoder tensor from the
+            # verified VLA-JEPA checkpoint before using this opt-in path.
+            self.vj_encoder = AutoModel.from_config(AutoConfig.from_pretrained(encoder_config.base_encoder))
+        else:
+            self.vj_encoder = AutoModel.from_pretrained(encoder_config.base_encoder)
+        # This is a fixed target encoder, including dropout/eval state. Removing
+        # it from autograd also avoids unused trainable parameters under DDP.
+        self.vj_encoder.requires_grad_(False)
+        self.vj_encoder.eval()
         self.vj_processor = AutoVideoProcessor.from_pretrained(self.config.framework.vj2_model.base_encoder)
 
         tubelet_size = self.vj_encoder.config.tubelet_size
+        if (self.config.framework.vj2_model.num_frames % tubelet_size
+                or self.config.framework.vj2_model.num_frames // tubelet_size < 2):
+            raise ValueError("Video horizon must contain at least two complete encoder tubelets")
         self.vj_predictor = VisionTransformerPredictorAC(
             num_frames=self.config.framework.vj2_model.num_frames//tubelet_size,
             img_size=((self.vj_encoder.config.image_size, self.vj_encoder.config.image_size)),
@@ -98,6 +149,12 @@ class VLA_JEPA(baseframework):
         )
 
         self.embodied_replace_prompt = "".join([embodied_action_token * self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction])
+
+    def train(self, mode=True):
+        super().train(mode)
+        if hasattr(self, "vj_encoder"):
+            self.vj_encoder.eval()
+        return self
 
     def expand_tokenizer(self, 
                          tokenizer: AutoTokenizer,
@@ -139,12 +196,14 @@ class VLA_JEPA(baseframework):
         batch_images = [example["image"] for example in examples]  # [B, [PIL.Image]]
         batch_videos = [example["video"] for example in examples]  #  [B, V, T, H, W, 3]
         instructions = [example["lang"] for example in examples]  # [B, str]
-        actions = [example["action"]for example in examples] if "action" in examples[0] else None # label [B， len, 7]
+        actions = [example["action"]for example in examples] if "action" in examples[0] else None # [B, horizon, config.action_dim]
         
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
 
         batch_videos = np.stack(batch_videos)  #  [B, V, T, H, W, 3]
         batch_videos = batch_videos.transpose(0,1,2,5,3,4)  # [B, V, T, 3, H, W]
+        if batch_videos.shape[1] != 2 or batch_videos.shape[2] != self.config.framework.vj2_model.num_frames:
+            raise ValueError("Expected two synchronized views with the configured video horizon")
 
         # Step 1: QWenVL input format
         if actions is not None:
@@ -166,7 +225,8 @@ class VLA_JEPA(baseframework):
         embodied_action_indices = torch.isin(qwen_inputs['input_ids'], torch.tensor([self.embodied_action_token_id], device=qwen_inputs['input_ids'].device))
         embodied_action_indices = embodied_action_indices.nonzero(as_tuple=True)
         
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        device_type = qwen_inputs["input_ids"].device.type
+        with torch.autocast(device_type, dtype=torch.bfloat16, enabled=device_type == "cuda"):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
                 output_attentions=False,
@@ -185,9 +245,13 @@ class VLA_JEPA(baseframework):
             input_videos = []
             for i in range(B*V):
                 input_videos.append(self.vj_processor(
-                    videos=batch_videos[i], return_tensors="pt"
+                    videos=batch_videos[i], return_tensors="pt", do_sample_frames=False
                 )["pixel_values_videos"].to(self.vj_encoder.device))
             input_videos = torch.cat(input_videos, dim=0)  # [B*V, T, C, H, W]
+            if input_videos.shape[:3] != (B * V, T, C):
+                raise ValueError("Video processor changed the supplied frame timing or channel layout")
+            video_is_pad = stack_padding_mask(examples, "video_is_pad", T, input_videos.device)
+            self.vj_encoder.eval()
             with torch.no_grad():
                 video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
                 num_temporal_steps = T // self.vj_encoder.config.tubelet_size
@@ -208,37 +272,50 @@ class VLA_JEPA(baseframework):
                 action_tokens
             )
 
-            teacher_forcing_wm_loss = F.l1_loss(
+            teacher_forcing_wm_loss = masked_world_model_l1(
                 predicted_states,
                 gt_states,
-                reduction="mean"
+                video_is_pad,
+                self.vj_encoder.config.tubelet_size,
             )
         
         if "action" not in examples[0]:
             return {"wm_loss": teacher_forcing_wm_loss}
 
         # Step 4: Action Expert Forward and Loss
-        with torch.autocast("cuda", dtype=torch.float32):
+        # CUDA autocast does not support float32. Explicitly disable it and
+        # cast Qwen's bf16 features to the action expert's parameter dtype.
+        with torch.autocast(last_hidden.device.type, enabled=False):
 
             actions = torch.tensor(
-                np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
+                np.array(actions), device=last_hidden.device, dtype=self.action_model.dtype
             )  # [B, T_full, action_dim]
             actions_target = actions[:, -(self.future_action_window_size+1):, :]  # (B, chunk_len, action_dim)
+            action_is_pad = stack_padding_mask(examples, "action_is_pad", actions.shape[1], actions.device)
+            if action_is_pad is not None:
+                action_is_pad = action_is_pad[:, -(self.future_action_window_size + 1):]
 
             repeated_diffusion_steps = (
                 self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
             )
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
-            embodied_action_repeated = embodied_action_tokens.repeat(repeated_diffusion_steps, 1, 1)
+            embodied_action_repeated = embodied_action_tokens.to(self.action_model.dtype).repeat(repeated_diffusion_steps, 1, 1)
             
             state_repeated = None
             if state is not None:
                 state = torch.tensor(
-                    np.array(state), device=last_hidden.device, dtype=last_hidden.dtype
+                    np.array(state), device=last_hidden.device, dtype=self.action_model.dtype
                 )
+                if state.ndim == 2:
+                    state = state.unsqueeze(1)
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
-            action_loss = self.action_model(embodied_action_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
+            if action_is_pad is None:
+                action_loss = self.action_model(embodied_action_repeated, actions_target_repeated, state_repeated)
+            else:
+                action_loss = self.action_model(
+                    embodied_action_repeated, actions_target_repeated, state_repeated,
+                    action_is_pad=action_is_pad.repeat(repeated_diffusion_steps, 1))
 
         return {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss * 0.1}
 
@@ -251,24 +328,20 @@ class VLA_JEPA(baseframework):
         **kwargs: str,
     ) -> np.ndarray:
         """
-        推理：单次前向直接回归未来动作（无扩散采样）。
-
-        Steps:
-          1. Resize images to training resolution (if specified)
-          2. Encode with QwenVL (hidden states retained)
-          6. Return normalized action trajectory
+        Encode images/instruction and sample the configured flow-matching head.
+        Inputs and outputs use the same coordinates and units as training.
+        This method does not normalize, clip, or access dataset statistics.
 
         Args:
             batch_images: List of samples; each sample is List[PIL.Image] (multi-view).
             instructions: List[str] natural language task instructions.
-            cfg_scale: >1 enables classifier-free guidance (scales conditional vs unconditional).
-            use_ddim: Whether to use DDIM deterministic sampling.
-            num_ddim_steps: Number of DDIM steps if enabled.
+            state: Optional [B, state_dim] or [B, state_tokens, state_dim].
             **kwargs: Reserved.
 
         Returns:
             dict:
-                normalized_actions (np.ndarray): Shape [B, T, action_dim], diffusion-sampled normalized actions.
+                normalized_actions (np.ndarray): Legacy output key, shape
+                    [B, action_horizon, action_dim]; native training units.
         """
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
         if train_obs_image_size:
@@ -284,7 +357,8 @@ class VLA_JEPA(baseframework):
         #embodied_action_indices = ~torch.isin(qwen_inputs['input_ids'], torch.tensor(self.action_token_ids, device=qwen_inputs['input_ids'].device))
         embodied_action_indices = embodied_action_indices.nonzero(as_tuple=True)
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        device_type = qwen_inputs["input_ids"].device.type
+        with torch.autocast(device_type, dtype=torch.bfloat16, enabled=device_type == "cuda"):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
                 output_attentions=False,
@@ -296,12 +370,17 @@ class VLA_JEPA(baseframework):
             B, _, H = last_hidden.shape
             embodied_action_tokens = last_hidden[embodied_action_indices[0], embodied_action_indices[1], :].view(B, -1, H)
 
-        state = torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype) if state is not None else None
+        state = torch.as_tensor(np.array(state), device=last_hidden.device, dtype=self.action_model.dtype) if state is not None else None
+        if state is not None and state.ndim == 1 and B == 1:
+            state = state.unsqueeze(0)
         # Step 4: Action Expert Forward and Loss
-        with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(embodied_action_tokens, state)  # (B, chunk_len, action_dim)
+        with torch.autocast(last_hidden.device.type, enabled=False):
+            pred_actions = self.action_model.predict_action(embodied_action_tokens.to(self.action_model.dtype), state)
 
-        normalized_actions = pred_actions.detach().cpu().numpy()
+        # The historical key names the network output, not an implicit stats
+        # transform: Piper's xyz metres + row-major rot6 remain in native units.
+        # No dataset normalization statistics are needed by this entry point.
+        normalized_actions = pred_actions.float().detach().cpu().numpy()
         return {"normalized_actions": normalized_actions, "embodied_action_tokens": embodied_action_tokens.to(dtype=torch.float32).detach().cpu().numpy()}
 
 
